@@ -1,0 +1,197 @@
+---
+title: "NHANES - RSV Data Analysis"
+output: html_notebook
+---
+
+Lets load the required libraries first. We will use the nhanesA library for data retrieval and dplyr for basic data manipulation. 
+
+```{r}
+#clean/clear workspace
+#rm(list = ls())          #clear workspace variables
+#gc()                     #garbage collection
+#cat("\014")              #clear console
+
+#install required libraries
+library(nhanesA)
+library(dplyr)
+library(purrr)
+
+```
+
+After reviewing the CDC NHANES website, we can see that the data for HSV (Herpes Simplex Virus) is available as two columns in various tables. Those column names are `LBXHE1` and `LBXHE2`. The first column is for HSV-1 and the second column is for HSV-2. We will use the table search function in the NHANESA library to find out which tables have these columns.
+
+```{r}
+hsv_tables = nhanesSearchVarName(varname = 'LBXHE1')
+print(hsv_tables)
+```
+
+Now that we have this info, we can iteratively extract all the lab results that contain the two variables.   
+
+```{r}
+# Iteratively extract all the tables from hsv_tables list
+
+hsv_df <- map_dfr(
+  hsv_tables,
+  ~ nhanes(.x) %>% mutate(hsv_table_name = .x)
+)
+
+str(hsv_df)
+```
+
+```{r}
+demo_tables = nhanesSearchTableNames('DEMO')
+print(demo_tables)
+```
+
+
+```{r}
+# Iteratively extract all the tables from demo_tables list
+
+demo_df <- map_dfr(
+  demo_tables,
+  ~ nhanes(.x, translated = TRUE, cleanse_numeric = TRUE) %>%
+      mutate(across(everything(), as.character)) %>%
+      mutate(demo_table_name = .x)
+)
+
+
+str(demo_df)
+```
+
+```{r}
+vars <- names(demo_df)
+
+```
+
+
+```{r}
+library(nhanesA)
+library(purrr)
+library(dplyr)
+library(tibble)
+
+get_codebook_info <- function(var, table_name) {
+  tryCatch({
+    cb <- nhanesCodebook(table_name, var)
+    
+    tibble(
+      variable = var,
+      sas_label = cb$SasLabel,
+      english_text = cb$EnglishText,
+      target = cb$Target
+    )
+  }, error = function(e) {
+    tibble(
+      variable = var,
+      sas_label = NA_character_,
+      english_text = NA_character_,
+      target = NA_character_
+    )
+  })
+}
+
+```
+
+
+```{r}
+str(nhanesCodebook(nh_table = "DEMO_I"))
+```
+
+
+```{r}
+table_name <- "DEMO_J"
+
+data_dictionary <- map_dfr(vars, get_codebook_info, table_name = table_name)
+demo_tables
+```
+
+```{r}
+library(nhanesA)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+demo_tables <- c("DEMO","DEMO_B","DEMO_C","DEMO_D","DEMO_E","DEMO_F",
+                 "DEMO_G","DEMO_H","DEMO_I","DEMO_J","DEMO_L","P_DEMO")
+
+vars_in_df <- names(demo_df)
+
+# Normalize one variable codebook entry into a 1-row tibble
+one_var_row <- function(x, tbl, var) {
+
+  # Case 1: named character vector like SEQN
+  if (is.atomic(x) && !is.null(names(x))) {
+    return(tibble(
+      source_table = tbl,
+      variable     = var,
+      sas_label    = unname(x[["SAS Label:"]])    %||% NA_character_,
+      english_text = unname(x[["English Text:"]]) %||% NA_character_,
+      target       = unname(x[["Target:"]])       %||% NA_character_
+    ))
+  }
+
+  # Case 2: list with various key names
+  if (is.list(x)) {
+    nms <- names(x)
+
+    get_key <- function(possible_names) {
+      hit <- possible_names[possible_names %in% nms][1]
+      if (length(hit) == 0 || is.na(hit)) return(NA_character_)
+      as.character(x[[hit]])
+    }
+
+    return(tibble(
+      source_table = tbl,
+      variable     = var,
+      sas_label    = get_key(c("SAS Label:", "SAS Label", "SasLabel")),
+      english_text = get_key(c("English Text:", "English Text", "EnglishText")),
+      target       = get_key(c("Target:", "Target"))
+    ))
+  }
+
+  # Fallback
+  tibble(
+    source_table = tbl,
+    variable     = var,
+    sas_label = NA_character_,
+    english_text = NA_character_,
+    target = NA_character_
+  )
+}
+
+# NULL-coalescing helper
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a)) a else b
+
+# Convert one table's full codebook into a tibble
+table_dict <- function(tbl) {
+  cb <- nhanesCodebook(tbl)
+  if (is.null(cb) || length(cb) == 0) return(tibble())
+
+  imap_dfr(cb, function(x, var) one_var_row(x, tbl, var))
+}
+
+# Build master dictionary across all DEMO tables
+master_dict <- map_dfr(demo_tables, function(tbl) {
+  message("Fetching: ", tbl)
+  tryCatch(table_dict(tbl), error = function(e) {
+    message("FAILED: ", tbl, " | ", conditionMessage(e))
+    tibble()
+  })
+})
+
+# Filter to your merged dataframe columns + add R class
+data_dictionary <- master_dict %>%
+  filter(variable %in% vars_in_df) %>%
+  group_by(variable) %>%
+  summarise(
+    source_tables = paste(sort(unique(source_table)), collapse = ", "),
+    sas_label     = first(na.omit(sas_label)),
+    english_text  = first(na.omit(english_text)),
+    target        = first(na.omit(target)),
+    .groups = "drop"
+  ) %>%
+  mutate(r_class = map_chr(variable, ~ class(demo_df[[.x]])[1]))
+
+```
+
+WATCHOUT - HSV files should have a weighting factor in them somewhere. These are likely to be the limiting sets in the data. and therefore need to be adjusted with it accordingly. The column next to SEQN is usually the weighting factor. The naming convention status is important because of the alphabetical ordering. Establishing a reference that is somewhat representation of the general population. Or meaningful. For example, if we are looking at HSV-1 and HSV-2, then we can use the weighting factor for the lab data. If we are looking at demographics, then we can use the weighting factor for the demographics data. We need to make sure that we are using the correct weighting factor for the correct data.. Can we do a tukey's analysis to see if the age group selection and ordering has any impact. Similarly, for marital status and education. NHANES is not consistent with "Not Responsive" etc. So pay some attention to the datasets. Another watchout: It made a lot more sense to change the variable name in R than changing it in the word documents.  
