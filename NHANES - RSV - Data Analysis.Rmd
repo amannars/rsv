@@ -60,7 +60,7 @@ str(demo_df)
 
 ```{r}
 vars <- names(demo_df)
-
+vars
 ```
 
 

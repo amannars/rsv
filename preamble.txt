@@ -1,0 +1,13 @@
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{colortbl}
+\usepackage{xcolor}
+\floatplacement{figure}{H}
+\floatplacement{table}{H}
+\captionsetup[table]{labelsep=period, singlelinecheck=false}
+\captionsetup[figure]{labelsep=period}
+\captionsetup[table]{labelsep=period, singlelinecheck=false}
+\captionsetup[figure]{labelsep=period}

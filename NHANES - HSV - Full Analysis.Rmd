@@ -1,0 +1,1254 @@
+---
+title: "NHANES - Herpes Simplex Virus (HSV) Seroprevalence Analysis"
+subtitle: "End-to-End Population-Level Analysis of HSV-1 and HSV-2 in the US Population"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+date: "`r Sys.Date()`"
+---
+
+# Background
+
+This notebook presents an end-to-end analysis of Herpes Simplex Virus (HSV) [seroprevalence](https://www.google.com/search?q=seroprevalence&sourceid=chrome&ie=UTF-8) in the United States using the National Health and Nutrition Examination Survey (NHANES). Two HSV types are examined:
+
+- **HSV-1** (`LBXHE1`): Typically associated with oral herpes (cold sores), though it can also cause genital herpes
+- **HSV-2** (`LBXHE2`): Primarily associated with genital herpes
+
+Seropositivity is determined via antibody testing, meaning a positive result indicates prior infection (not necessarily active disease). This analysis examines which demographic and health-related factors are associated with HSV seropositivity at the population level using NHANES complex survey design weights.
+
+> **Important note on survey weights:** The HSV subsample weight is used for all prevalence and regression analyses. Because NHANES sub-selects participants for laboratory testing, the weight in the HSV lab tables is the correct limiting weight. When pooling multiple cycles, the weight is divided by the number of 2-year cycles combined.
+
+---
+
+# Section 1: Setup and Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+# Clear workspace
+rm(list = ls())
+gc()
+cat("\014")
+
+# Load required libraries
+library(nhanesA)    # NHANES data retrieval
+library(dplyr)      # Data manipulation
+library(purrr)      # Functional programming (map_dfr etc.)
+library(tibble)     # Tidy data frames
+library(survey)     # Complex survey analysis
+library(ggplot2)    # Visualizations
+library(knitr)      # Table formatting
+library(kableExtra) # Enhanced table formatting
+library(tidyr)      # Data reshaping
+
+# Suppress scientific notation for readability
+options(scipen = 10, digits = 4)
+```
+
+---
+
+# Section 2: Data Discovery
+
+We use the `nhanesA` library to identify which NHANES tables contain the HSV serology variables `LBXHE1` (HSV-1) and `LBXHE2` (HSV-2), then pull all available demographic (DEMO) tables for merging.
+
+```{r discover-hsv-tables, message=FALSE, warning=FALSE}
+# Find all NHANES tables containing HSV-1 variable
+hsv_tables <- nhanesSearchVarName(varname = "LBXHE1")
+cat("NHANES tables containing LBXHE1 (HSV-1):\n")
+print(hsv_tables)
+```
+
+```{r discover-demo-tables, message=FALSE, warning=FALSE}
+# Find all NHANES DEMO tables
+demo_tables_all <- nhanesSearchTableNames("DEMO")
+cat("All NHANES DEMO tables found:\n")
+print(demo_tables_all)
+```
+
+---
+
+# Section 3: Data Download
+
+## 3.1 HSV Serological Data
+
+We download HSV data from all available cycles and stack them into a single data frame. NHANES weight columns always start with `"WT"` — the function detects this automatically and renames the weight to `HSV_WT`. Tables that carry no subsample weight (e.g., `SSHE_B`) get `HSV_WT = NA` and fall back to `WTMEC2YR` from the DEMO table during the analytic sample step.
+
+```{r download-hsv, message=FALSE, warning=FALSE, cache=TRUE}
+# Helper: download one table, detect weight column safely, add cycle tag
+download_hsv_table <- function(tbl_name) {
+  message("Downloading HSV table: ", tbl_name)
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+
+    # Only rename a column to HSV_WT if it is actually a weight variable.
+    # Weight columns in NHANES always start with "WT" (e.g., WTSSHE2Y, WTMEC2YR).
+    # Some HSV tables (e.g., SSHE_B) have NO separate weight column; in those
+    # cases the 2nd column is LBXHE1 itself — we must NOT rename it.
+    wt_cols <- grep("^WT", names(df), value = TRUE)
+    if (length(wt_cols) > 0) {
+      df <- df %>% rename(HSV_WT = !!sym(wt_cols[1]))
+    } else {
+      # No subsample weight found; will fall back to WTMEC2YR from DEMO
+      df$HSV_WT <- NA_real_
+    }
+
+    # Keep only columns we need
+    keep_cols <- intersect(names(df), c("SEQN", "HSV_WT", "LBXHE1", "LBXHE2"))
+    df <- df %>%
+      select(all_of(keep_cols)) %>%
+      mutate(hsv_cycle = tbl_name)
+
+    return(df)
+  }, error = function(e) {
+    message("  FAILED: ", tbl_name, " | ", conditionMessage(e))
+    return(NULL)
+  })
+}
+
+# Download and combine all HSV tables
+hsv_list <- lapply(hsv_tables, download_hsv_table)
+hsv_list <- Filter(Negate(is.null), hsv_list)
+
+# Stack all cycles - use common columns only
+hsv_raw <- bind_rows(hsv_list)
+
+cat("\n--- HSV Raw Data Summary ---\n")
+cat("Total rows (across all cycles):", nrow(hsv_raw), "\n")
+cat("Cycles included:", paste(unique(hsv_raw$hsv_cycle), collapse = ", "), "\n")
+cat("HSV-WT missing:", sum(is.na(hsv_raw$HSV_WT)), "\n")
+cat("LBXHE1 missing:", sum(is.na(hsv_raw$LBXHE1)), "\n")
+cat("LBXHE2 missing:", sum(is.na(hsv_raw$LBXHE2)), "\n")
+```
+
+```{r hsv-value-codes}
+# Check what value labels are used after translation
+cat("LBXHE1 (HSV-1) value distribution:\n")
+print(table(hsv_raw$LBXHE1, useNA = "ifany"))
+
+cat("\nLBXHE2 (HSV-2) value distribution:\n")
+print(table(hsv_raw$LBXHE2, useNA = "ifany"))
+```
+
+## 3.2 Demographics
+
+Download all NHANES DEMO tables and combine into a single data frame. We convert all columns to character before stacking since different cycles may have different encodings, then keep only the variables needed for this analysis.
+
+```{r download-demo, message=FALSE, warning=FALSE, cache=TRUE}
+# Covariates to retain from DEMO tables
+demo_keepers <- c("SEQN", "SDDSRVYR", "RIDSTATR",
+                  "WTINT2YR", "WTMEC2YR",
+                  "SDMVPSU", "SDMVSTRA",
+                  "RIAGENDR", "RIDAGEYR",
+                  "RIDRETH1", "RIDRETH3",
+                  "DMDMARTL", "DMDEDUC2",
+                  "DMDBORN4", "INDFMPIR")
+
+download_demo_table <- function(tbl_name) {
+  message("Downloading DEMO table: ", tbl_name)
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE) %>%
+      mutate(across(everything(), as.character)) %>%
+      mutate(demo_cycle = tbl_name)
+
+    # Keep only available demo keepers
+    keep <- intersect(names(df), c(demo_keepers, "demo_cycle"))
+    df %>% select(all_of(keep))
+  }, error = function(e) {
+    message("  FAILED: ", tbl_name, " | ", conditionMessage(e))
+    NULL
+  })
+}
+
+demo_list <- lapply(demo_tables_all, download_demo_table)
+demo_list <- Filter(Negate(is.null), demo_list)
+demo_raw  <- bind_rows(demo_list)
+
+cat("\n--- Demographics Raw Data Summary ---\n")
+cat("Total rows:", nrow(demo_raw), "\n")
+cat("Cycles included:", paste(unique(demo_raw$demo_cycle), collapse = ", "), "\n")
+```
+
+## 3.3 BMI Data
+
+```{r download-bmi, message=FALSE, warning=FALSE, cache=TRUE}
+bmi_tables <- nhanesSearchTableNames("BMX")
+
+download_bmi_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    if (!"BMXBMI" %in% names(df)) return(NULL)
+    df %>%
+      select(SEQN, BMXBMI) %>%
+      mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+
+bmi_list <- lapply(bmi_tables, download_bmi_table)
+bmi_raw  <- bind_rows(Filter(Negate(is.null), bmi_list)) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+cat("BMI records:", nrow(bmi_raw), "\n")
+```
+
+## 3.4 Smoking Data
+
+```{r download-smoking, message=FALSE, warning=FALSE, cache=TRUE}
+smq_tables <- nhanesSearchTableNames("SMQ")
+
+download_smq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    keep <- intersect(names(df), c("SEQN", "SMQ020", "SMQ040"))
+    if (length(keep) < 2) return(NULL)
+    df %>%
+      select(all_of(keep)) %>%
+      mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+
+smq_list <- lapply(smq_tables, download_smq_table)
+smq_raw  <- bind_rows(Filter(Negate(is.null), smq_list)) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+cat("Smoking records:", nrow(smq_raw), "\n")
+```
+
+## 3.5 Alcohol Data
+
+```{r download-alcohol, message=FALSE, warning=FALSE, cache=TRUE}
+alq_tables <- nhanesSearchTableNames("ALQ")
+
+download_alq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    keep <- intersect(names(df), c("SEQN", "ALQ101", "ALQ110"))
+    if (length(keep) < 2) return(NULL)
+    df %>%
+      select(all_of(keep)) %>%
+      mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+
+alq_list <- lapply(alq_tables, download_alq_table)
+alq_raw  <- bind_rows(Filter(Negate(is.null), alq_list)) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+cat("Alcohol records:", nrow(alq_raw), "\n")
+```
+
+## 3.6 Diabetes Data
+
+```{r download-diabetes, message=FALSE, warning=FALSE, cache=TRUE}
+diq_tables <- nhanesSearchTableNames("DIQ")
+
+download_diq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    if (!"DIQ010" %in% names(df)) return(NULL)
+    df %>%
+      select(SEQN, DIQ010) %>%
+      mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+
+diq_list <- lapply(diq_tables, download_diq_table)
+diq_raw  <- bind_rows(Filter(Negate(is.null), diq_list)) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+cat("Diabetes records:", nrow(diq_raw), "\n")
+```
+
+---
+
+# Section 4: Data Merging and Cleaning
+
+## 4.1 Merge All Data Sources
+
+The HSV lab subsample is the limiting dataset. We start with HSV records and left-join demographics and health data.
+
+```{r merge-data}
+# Convert SEQN to character everywhere before joining
+hsv_df   <- hsv_raw   %>% mutate(SEQN = as.character(SEQN))
+demo_df  <- demo_raw  %>% mutate(SEQN = as.character(SEQN))
+bmi_df   <- bmi_raw   %>% mutate(SEQN = as.character(SEQN))
+smq_df   <- smq_raw   %>% mutate(SEQN = as.character(SEQN))
+alq_df   <- alq_raw   %>% mutate(SEQN = as.character(SEQN))
+diq_df   <- diq_raw   %>% mutate(SEQN = as.character(SEQN))
+
+# Merge: HSV is the anchor (limiting subsample)
+data_merged <- hsv_df %>%
+  left_join(demo_df  %>% select(-any_of("demo_cycle")), by = "SEQN") %>%
+  left_join(bmi_df,  by = "SEQN") %>%
+  left_join(smq_df,  by = "SEQN") %>%
+  left_join(alq_df,  by = "SEQN") %>%
+  left_join(diq_df,  by = "SEQN")
+
+cat("Total records after merge:", nrow(data_merged), "\n")
+cat("Records with HSV_WT:", sum(!is.na(data_merged$HSV_WT)), "\n")
+```
+
+## 4.2 Create HSV Binary Variables
+
+Convert the translated HSV result into 1 (Positive) / 0 (Negative) binary variables for regression modeling.
+
+```{r create-hsv-binary}
+data_merged <- data_merged %>%
+  mutate(
+    # HSV-1: 1 = Positive, 0 = Negative
+    HSV1_pos = case_when(
+      grepl("^[Pp]ositive", as.character(LBXHE1)) ~ 1L,
+      grepl("^[Nn]egative", as.character(LBXHE1)) ~ 0L,
+      LBXHE1 == "1" ~ 1L,
+      LBXHE1 == "2" ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    # HSV-2: 1 = Positive, 0 = Negative
+    HSV2_pos = case_when(
+      grepl("^[Pp]ositive", as.character(LBXHE2)) ~ 1L,
+      grepl("^[Nn]egative", as.character(LBXHE2)) ~ 0L,
+      LBXHE2 == "1" ~ 1L,
+      LBXHE2 == "2" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+cat("HSV-1 seropositive:", sum(data_merged$HSV1_pos == 1, na.rm = TRUE), "\n")
+cat("HSV-1 seronegative:", sum(data_merged$HSV1_pos == 0, na.rm = TRUE), "\n")
+cat("HSV-2 seropositive:", sum(data_merged$HSV2_pos == 1, na.rm = TRUE), "\n")
+cat("HSV-2 seronegative:", sum(data_merged$HSV2_pos == 0, na.rm = TRUE), "\n")
+```
+
+## 4.3 Clean Covariates
+
+Apply the same data cleaning conventions from the R programs: standardize non-response labels and create categorical variables.
+
+```{r clean-covariates}
+# Work on a clean copy
+clean_data <- data_merged %>%
+  mutate(
+    # Convert numeric columns
+    RIDAGEYR  = suppressWarnings(as.numeric(RIDAGEYR)),
+    INDFMPIR  = suppressWarnings(as.numeric(INDFMPIR)),
+    BMXBMI    = suppressWarnings(as.numeric(BMXBMI)),
+    HSV_WT    = suppressWarnings(as.numeric(HSV_WT)),
+    WTMEC2YR  = suppressWarnings(as.numeric(WTMEC2YR)),
+    WTINT2YR  = suppressWarnings(as.numeric(WTINT2YR)),
+    SDMVPSU   = suppressWarnings(as.numeric(SDMVPSU)),
+    SDMVSTRA  = suppressWarnings(as.numeric(SDMVSTRA))
+  )
+
+# --- Standardize non-responsive / missing labels ---
+clean_non_resp <- function(x) {
+  x[x %in% c("Refused", "Don't Know", "Don't know",
+              "7", "9", "77", "99")] <- "8 Non-Responsive"
+  x[is.na(x)] <- "9 Missing"
+  x
+}
+
+clean_data <- clean_data %>%
+  mutate(
+    DMDMARTL = clean_non_resp(DMDMARTL),
+    RIDRETH1  = clean_non_resp(RIDRETH1),
+    RIDRETH3  = clean_non_resp(RIDRETH3),
+    DMDEDUC2  = clean_non_resp(DMDEDUC2),
+    DMDBORN4  = clean_non_resp(DMDBORN4)
+  )
+
+# --- Age categories ---
+clean_data <- clean_data %>%
+  mutate(
+    Age_cat = case_when(
+      RIDAGEYR >= 14 & RIDAGEYR < 20 ~ "1 14-19",
+      RIDAGEYR >= 20 & RIDAGEYR < 30 ~ "2 20-29",
+      RIDAGEYR >= 30 & RIDAGEYR < 40 ~ "3 30-39",
+      RIDAGEYR >= 40 & RIDAGEYR < 50 ~ "4 40-49",
+      RIDAGEYR >= 50 & RIDAGEYR < 60 ~ "5 50-59",
+      RIDAGEYR >= 60               ~  "6 60+",
+      TRUE ~ NA_character_
+    )
+  )
+
+# --- BMI categories ---
+clean_data <- clean_data %>%
+  mutate(
+    BMI_cat = case_when(
+      BMXBMI < 18.5              ~ "1 Underweight",
+      BMXBMI >= 18.5 & BMXBMI < 25 ~ "2 Normal",
+      BMXBMI >= 25   & BMXBMI < 30 ~ "3 Overweight",
+      BMXBMI >= 30               ~ "4 Obese",
+      TRUE ~ "9 Missing"
+    )
+  )
+
+# --- Smoking category ---
+clean_data <- clean_data %>%
+  mutate(
+    SMQ_cat = case_when(
+      SMQ020 == "No"                                         ~ "0 Never smoked",
+      SMQ040 %in% c("Every day", "Some days")               ~ "2 Current smoker",
+      SMQ040 == "Not at all" & SMQ020 == "Yes"              ~ "1 Former smoker",
+      SMQ040 %in% c("Refused", "Don't Know", "Don't know")  ~ "8 Non-Responsive",
+      TRUE ~ "9 Missing"
+    )
+  )
+
+# --- Alcohol category ---
+clean_data <- clean_data %>%
+  mutate(
+    ALQ_col = coalesce(ALQ110, ALQ101),  # ALQ110 used in later cycles; ALQ101 in earlier
+    ALQ_cat = case_when(
+      ALQ_col == "No"                                         ~ "0 Less than 12 drinks",
+      ALQ_col == "Yes"                                        ~ "1 More than 12 drinks",
+      ALQ_col %in% c("Refused", "Don't Know", "Don't know")  ~ "8 Non-Responsive",
+      TRUE ~ "9 Missing"
+    )
+  )
+
+# --- Diabetes category ---
+clean_data <- clean_data %>%
+  mutate(
+    DIQ_cat = case_when(
+      DIQ010 == "No"                                         ~ "0 No",
+      DIQ010 == "Borderline"                                 ~ "1 Borderline",
+      DIQ010 == "Yes"                                        ~ "2 Yes",
+      DIQ010 %in% c("Refused", "Don't Know", "Don't know")  ~ "8 Non-Responsive",
+      TRUE ~ "9 Missing"
+    )
+  )
+
+# --- Race/Ethnicity standardized labels ---
+clean_data <- clean_data %>%
+  mutate(
+    RIDRETH1 = case_when(
+      RIDRETH1 == "Non-Hispanic White"                   ~ "1 NH White",
+      RIDRETH1 == "Non-Hispanic Black"                   ~ "2 NH Black",
+      RIDRETH1 == "Mexican American"                     ~ "3 Mexican American",
+      RIDRETH1 == "Other Hispanic"                       ~ "4 Other Hispanic",
+      RIDRETH1 == "Other Race - Including Multi-Racial"  ~ "5 Other/Multi",
+      TRUE ~ RIDRETH1
+    ),
+    # Country of birth
+    DMDBORN4 = case_when(
+      startsWith(as.character(DMDBORN4), "B") ~ "1 Born in USA",
+      startsWith(as.character(DMDBORN4), "O") ~ "2 Born outside USA",
+      TRUE ~ DMDBORN4
+    ),
+    # Marital status: simplified groupings
+    DMDMARTL = case_when(
+      DMDMARTL %in% c("Married", "Living with partner") ~ "1 Married/Partner",
+      DMDMARTL == "Never married"                        ~ "2 Never married",
+      DMDMARTL == "Widowed"                              ~ "3 Widowed",
+      DMDMARTL %in% c("Divorced", "Separated")          ~ "4 Divorced/Sep",
+      TRUE ~ DMDMARTL
+    ),
+    # Education
+    DMDEDUC2 = case_when(
+      startsWith(as.character(DMDEDUC2), "Le") ~ "01 <9th grade",
+      startsWith(as.character(DMDEDUC2), "9-") ~ "02 9-11th grade",
+      startsWith(as.character(DMDEDUC2), "Hi") ~ "03 HS grad/GED",
+      startsWith(as.character(DMDEDUC2), "So") ~ "04 Some college/AA",
+      startsWith(as.character(DMDEDUC2), "Co") ~ "05 College grad+",
+      TRUE ~ DMDEDUC2
+    ),
+    # Poverty-income ratio categories
+    FIPR_cat = case_when(
+      INDFMPIR <= 1.5              ~ "1 Below 1.5",
+      INDFMPIR > 1.5 & INDFMPIR <= 3.0 ~ "2 1.5 - 3.0",
+      INDFMPIR > 3.0               ~ "3 Above 3.0",
+      TRUE ~ "9 Missing"
+    )
+  )
+
+cat("Cleaning complete.\n")
+cat("Clean dataset rows:", nrow(clean_data), "\n")
+```
+
+## 4.4 Define Analytic Sample
+
+We restrict to participants with valid HSV weights (lab subsample) and who completed the MEC examination.
+
+```{r define-sample}
+# Number of HSV cycles (divide weight by this for pooled estimates)
+n_cycles <- length(unique(clean_data$hsv_cycle))
+cat("Number of HSV cycles being pooled:", n_cycles, "\n")
+cat("Cycles:", paste(unique(clean_data$hsv_cycle), collapse = ", "), "\n\n")
+
+# Some HSV tables have no subsample weight of their own (HSV_WT is NA for
+# those cycles). Fall back to WTMEC2YR from the DEMO table in that case.
+cat("Records with HSV subsample weight:", sum(!is.na(clean_data$HSV_WT)), "\n")
+cat("Records falling back to WTMEC2YR: ",
+    sum(is.na(clean_data$HSV_WT) & !is.na(clean_data$WTMEC2YR)), "\n\n")
+
+clean_data <- clean_data %>%
+  mutate(
+    # Use HSV subsample weight where available; otherwise use MEC weight
+    effective_wt = if_else(!is.na(HSV_WT) & HSV_WT > 0, HSV_WT, WTMEC2YR)
+  )
+
+# Analytic sample: must have a valid effective weight
+analytic <- clean_data %>%
+  filter(!is.na(effective_wt), effective_wt > 0) %>%
+  mutate(
+    # Adjust weight for pooled multi-cycle analysis
+    adj_wt = effective_wt / n_cycles
+  )
+
+cat("Analytic sample size:", nrow(analytic), "\n")
+cat("  With HSV-1 result:", sum(!is.na(analytic$HSV1_pos)), "\n")
+cat("  With HSV-2 result:", sum(!is.na(analytic$HSV2_pos)), "\n")
+cat("  Missing SDMVPSU:",   sum(is.na(analytic$SDMVPSU)),  "\n")
+cat("  Missing SDMVSTRA:",  sum(is.na(analytic$SDMVSTRA)), "\n")
+
+# Collapse "8 Non-Responsive" into "9 Missing" for all categorical predictors.
+# "Non-Responsive" cells are typically near-empty, which causes quasi-complete
+# separation (extreme OR estimates) in logistic regression. Merging them into
+# the "Missing" category avoids this instability.
+analytic <- analytic %>%
+  mutate(across(
+    c(DMDMARTL, RIDRETH1, RIDRETH3, DMDEDUC2, DMDBORN4,
+      SMQ_cat, ALQ_cat, DIQ_cat, BMI_cat, FIPR_cat),
+    ~ if_else(. == "8 Non-Responsive", "9 Missing", .)
+  ))
+
+# Convert key categorical variables to factors
+analytic <- analytic %>%
+  mutate(
+    RIAGENDR  = as.factor(RIAGENDR),
+    RIDRETH1  = as.factor(RIDRETH1),
+    DMDBORN4  = as.factor(DMDBORN4),
+    DMDEDUC2  = as.factor(DMDEDUC2),
+    DMDMARTL  = as.factor(DMDMARTL),
+    Age_cat   = as.factor(Age_cat),
+    BMI_cat   = as.factor(BMI_cat),
+    SMQ_cat   = as.factor(SMQ_cat),
+    ALQ_cat   = as.factor(ALQ_cat),
+    DIQ_cat   = as.factor(DIQ_cat),
+    FIPR_cat  = as.factor(FIPR_cat)
+  )
+```
+
+---
+
+# Section 5: Descriptive Statistics
+
+## 5.1 Overall Seroprevalence
+
+```{r descriptive-prevalence}
+# Raw (unweighted) seroprevalence
+hsv1_prev_raw <- mean(analytic$HSV1_pos, na.rm = TRUE)
+hsv2_prev_raw <- mean(analytic$HSV2_pos, na.rm = TRUE)
+
+cat(sprintf("Unweighted HSV-1 seroprevalence: %.1f%%  (n=%d)\n",
+            100 * hsv1_prev_raw, sum(!is.na(analytic$HSV1_pos))))
+cat(sprintf("Unweighted HSV-2 seroprevalence: %.1f%%  (n=%d)\n",
+            100 * hsv2_prev_raw, sum(!is.na(analytic$HSV2_pos))))
+```
+
+## 5.2 Survey-Weighted Seroprevalence
+
+```{r svy-prevalence, message=FALSE, warning=FALSE}
+# Build survey design (exclude records missing PSU/strata)
+svy_data <- analytic %>%
+  filter(!is.na(SDMVPSU), !is.na(SDMVSTRA), !is.na(adj_wt))
+
+svy_design <- svydesign(
+  data    = svy_data,
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~adj_wt,
+  nest    = TRUE
+)
+
+# Weighted prevalence of HSV-1
+prev1 <- svymean(~HSV1_pos, design = svy_design, na.rm = TRUE)
+ci1   <- confint(prev1, df = degf(svy_design))
+cat(sprintf("Population-weighted HSV-1 seroprevalence: %.1f%%  (95%% CI: %.1f%% - %.1f%%)\n",
+            100 * coef(prev1), 100 * ci1[1], 100 * ci1[2]))
+
+# Weighted prevalence of HSV-2
+prev2 <- svymean(~HSV2_pos, design = svy_design, na.rm = TRUE)
+ci2   <- confint(prev2, df = degf(svy_design))
+cat(sprintf("Population-weighted HSV-2 seroprevalence: %.1f%%  (95%% CI: %.1f%% - %.1f%%)\n",
+            100 * coef(prev2), 100 * ci2[1], 100 * ci2[2]))
+```
+
+## 5.3 Seroprevalence by NHANES Cycle
+
+```{r prev-by-cycle}
+cycle_prev <- svy_data %>%
+  group_by(hsv_cycle) %>%
+  summarise(
+    N       = n(),
+    HSV1_n  = sum(HSV1_pos == 1, na.rm = TRUE),
+    HSV2_n  = sum(HSV2_pos == 1, na.rm = TRUE),
+    HSV1_pct = round(100 * mean(HSV1_pos, na.rm = TRUE), 1),
+    HSV2_pct = round(100 * mean(HSV2_pos, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+kable(cycle_prev,
+      caption = "Unweighted Seroprevalence by NHANES Cycle",
+      col.names = c("NHANES Cycle", "N", "HSV-1 Pos", "HSV-2 Pos",
+                    "HSV-1 %", "HSV-2 %")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## 5.4 Seroprevalence by Age Group
+
+```{r prev-by-age}
+age_prev <- svy_data %>%
+  filter(!is.na(Age_cat)) %>%
+  group_by(Age_cat) %>%
+  summarise(
+    N        = n(),
+    HSV1_pct = round(100 * mean(HSV1_pos, na.rm = TRUE), 1),
+    HSV2_pct = round(100 * mean(HSV2_pos, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+
+kable(age_prev,
+      caption = "Unweighted Seroprevalence by Age Group",
+      col.names = c("Age Group", "N", "HSV-1 %", "HSV-2 %")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## 5.5 Seroprevalence Visualization
+
+```{r prevalence-plot, fig.width=10, fig.height=5}
+# Seroprevalence by age group and sex
+age_sex_prev <- svy_data %>%
+  filter(!is.na(Age_cat), !is.na(RIAGENDR)) %>%
+  group_by(Age_cat, RIAGENDR) %>%
+  summarise(
+    HSV1_pct = 100 * mean(HSV1_pos, na.rm = TRUE),
+    HSV2_pct = 100 * mean(HSV2_pos, na.rm = TRUE),
+    N = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(HSV1_pct, HSV2_pct),
+               names_to = "HSV_type", values_to = "Prevalence") %>%
+  mutate(HSV_type = recode(HSV_type,
+                            "HSV1_pct" = "HSV-1",
+                            "HSV2_pct" = "HSV-2"))
+
+ggplot(age_sex_prev, aes(x = Age_cat, y = Prevalence, fill = RIAGENDR)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~HSV_type, scales = "free_y") +
+  scale_fill_manual(values = c("Male" = "#3182bd", "Female" = "#e6550d"),
+                    na.value = "grey50") +
+  labs(
+    title    = "HSV-1 and HSV-2 Seroprevalence by Age Group and Sex",
+    subtitle = "Unweighted sample estimates; NHANES pooled cycles",
+    x        = "Age Group",
+    y        = "Seroprevalence (%)",
+    fill     = "Sex"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r prev-by-race, fig.width=9, fig.height=5}
+race_prev <- svy_data %>%
+  filter(!is.na(RIDRETH1)) %>%
+  group_by(RIDRETH1) %>%
+  summarise(
+    HSV1_pct = 100 * mean(HSV1_pos, na.rm = TRUE),
+    HSV2_pct = 100 * mean(HSV2_pos, na.rm = TRUE),
+    N = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(HSV1_pct, HSV2_pct),
+               names_to = "HSV_type", values_to = "Prevalence") %>%
+  mutate(HSV_type = recode(HSV_type,
+                            "HSV1_pct" = "HSV-1",
+                            "HSV2_pct" = "HSV-2"))
+
+ggplot(race_prev, aes(x = RIDRETH1, y = Prevalence, fill = HSV_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("HSV-1" = "#6baed6", "HSV-2" = "#fd8d3c")) +
+  labs(
+    title = "HSV Seroprevalence by Race/Ethnicity",
+    x     = "Race/Ethnicity",
+    y     = "Seroprevalence (%)",
+    fill  = "HSV Type"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+# Section 6: Covariate Analysis — Sample (Unweighted) Contingency Tables
+
+This section produces contingency tables showing the distribution of each covariate by HSV status using raw (unweighted) counts. Chi-square tests with simulated p-values assess association.
+
+```{r contingency-helper}
+# Helper: print contingency table (covariate rows × HSV status columns)
+print_cont_table <- function(var, var_label, hsv_var, hsv_label, data) {
+  cat(sprintf("\n--- %s vs %s ---\n", var_label, hsv_label))
+
+  # Remove NAs in HSV status
+  sub_data <- data %>%
+    filter(!is.na(.data[[hsv_var]]), !is.na(.data[[var]])) %>%
+    mutate(HSV_status = ifelse(.data[[hsv_var]] == 1, "Positive", "Negative"))
+
+  tbl <- table(sub_data[[var]], sub_data$HSV_status)
+
+  # Ensure both columns exist
+  if (!("Positive" %in% colnames(tbl))) tbl <- cbind(tbl, Positive = 0)
+  if (!("Negative" %in% colnames(tbl))) tbl <- cbind(tbl, Negative = 0)
+  tbl <- tbl[, c("Negative", "Positive")]
+
+  row_totals  <- rowSums(tbl)
+  grand_total <- sum(tbl)
+  pct_pos     <- round(100 * tbl[, "Positive"] / row_totals, 1)
+  pct_neg     <- round(100 * tbl[, "Negative"] / row_totals, 1)
+
+  # Chi-square test
+  p_val <- tryCatch(
+    chisq.test(tbl, simulate.p.value = TRUE)$p.value,
+    error = function(e) NA
+  )
+
+  out <- data.frame(
+    Category      = rownames(tbl),
+    N             = row_totals,
+    `%_of_Total`  = round(100 * row_totals / grand_total, 1),
+    Negative_n    = tbl[, "Negative"],
+    `%_Neg`       = pct_neg,
+    Positive_n    = tbl[, "Positive"],
+    `%_Pos`       = pct_pos,
+    check.names   = FALSE
+  )
+
+  print(kable(out,
+              caption = sprintf("%s", var_label),
+              row.names = FALSE) %>%
+          kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                        full_width = FALSE))
+
+  invisible(list(table = tbl, p = p_val))
+}
+```
+
+## 6.1 HSV-1 Contingency Tables (Sample Estimates)
+
+```{r cont-tables-hsv1, results='asis', message=FALSE, warning=FALSE}
+covariate_list <- list(
+  list(var = "RIAGENDR",  label = "Sex"),
+  list(var = "Age_cat",   label = "Age Group"),
+  list(var = "RIDRETH1",  label = "Race/Ethnicity"),
+  list(var = "DMDBORN4",  label = "Country of Birth"),
+  list(var = "DMDEDUC2",  label = "Education Level"),
+  list(var = "DMDMARTL",  label = "Marital Status"),
+  list(var = "BMI_cat",   label = "BMI Category"),
+  list(var = "SMQ_cat",   label = "Smoking Status"),
+  list(var = "ALQ_cat",   label = "Alcohol Use"),
+  list(var = "DIQ_cat",   label = "Diabetes Status"),
+  list(var = "FIPR_cat",  label = "Poverty-Income Ratio")
+)
+
+for (cov in covariate_list) {
+  print_cont_table(cov$var, cov$label, "HSV1_pos", "HSV-1", svy_data)
+}
+```
+
+## 6.2 HSV-2 Contingency Tables (Sample Estimates)
+
+```{r cont-tables-hsv2, results='asis', message=FALSE, warning=FALSE}
+for (cov in covariate_list) {
+  print_cont_table(cov$var, cov$label, "HSV2_pos", "HSV-2", svy_data)
+}
+```
+
+---
+
+# Section 7: Covariate Analysis — Survey-Weighted (Population Estimates)
+
+Using the complex survey design, we compute population-level prevalence estimates for each covariate category, along with Rao-Scott chi-square tests.
+
+```{r svy-cont-helper}
+# Helper: survey-weighted contingency table for one covariate
+svy_cont_table <- function(var, var_label, hsv_var, hsv_label, design) {
+  cat(sprintf("\n--- %s vs %s (Population Estimates) ---\n", var_label, hsv_label))
+
+  formula_str <- as.formula(paste0("~", var, "+", hsv_var))
+
+  tbl  <- svytable(formula_str, design)
+  p_rs <- tryCatch(svychisq(formula_str, design)$p.value, error = function(e) NA)
+
+  # Row percentages
+  row_totals <- rowSums(tbl)
+  if (ncol(tbl) == 2) {
+    col_names <- colnames(tbl)
+    pos_col   <- col_names[2]
+    pct_pos   <- round(100 * tbl[, pos_col] / row_totals, 1)
+
+    out <- data.frame(
+      Category     = rownames(tbl),
+      Pop_Est_N    = round(row_totals),
+      Pos_Est      = round(tbl[, pos_col]),
+      Prevalence_pct = pct_pos
+    )
+
+    print(kable(out,
+                caption = sprintf("%s — %s", var_label, hsv_label),
+                row.names = FALSE) %>%
+            kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                          full_width = FALSE))
+  }
+  invisible(list(table = tbl, p = p_rs))
+}
+```
+
+## 7.1 HSV-1 Population Estimates
+
+```{r svy-cont-hsv1, results='asis', message=FALSE, warning=FALSE}
+# Rebuild design on svy_data for HSV-1 (remove NA in HSV1_pos)
+svy_hsv1 <- svy_data %>% filter(!is.na(HSV1_pos))
+design_hsv1 <- svydesign(
+  data    = svy_hsv1,
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~adj_wt,
+  nest    = TRUE
+)
+
+for (cov in covariate_list) {
+  svy_cont_table(cov$var, cov$label, "HSV1_pos", "HSV-1", design_hsv1)
+}
+```
+
+## 7.2 HSV-2 Population Estimates
+
+```{r svy-cont-hsv2, results='asis', message=FALSE, warning=FALSE}
+svy_hsv2 <- svy_data %>% filter(!is.na(HSV2_pos))
+design_hsv2 <- svydesign(
+  data    = svy_hsv2,
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~adj_wt,
+  nest    = TRUE
+)
+
+for (cov in covariate_list) {
+  svy_cont_table(cov$var, cov$label, "HSV2_pos", "HSV-2", design_hsv2)
+}
+```
+
+---
+
+# Section 8: Survey-Weighted Logistic Regression — HSV-1
+
+We fit a survey-weighted logistic regression (Prevalence Odds Ratios) for HSV-1 seropositivity, adjusting for all covariates simultaneously.
+
+```{r reg-print-helper}
+# Helper: format and display logistic regression results as OR table
+reg_print_logistic <- function(svy_glm, title = "") {
+  cat(sprintf("\n%s\n", title))
+  glm_summary <- summary(svy_glm)
+  coeff   <- glm_summary$coefficients[, 1]
+  p_val   <- glm_summary$coefficients[, 4]
+
+  # Odds Ratios and 95% CI
+  CI      <- confint(svy_glm)
+  OR      <- exp(coeff)
+  OR_LCL  <- exp(CI[, 1])
+  OR_UCL  <- exp(CI[, 2])
+
+  stars <- rep("", length(p_val))
+  stars[p_val <= 0.10] <- "*"
+  stars[p_val <= 0.05] <- "**"
+  stars[p_val <= 0.01] <- "***"
+
+  out <- data.frame(
+    Term     = names(coeff),
+    OR       = round(OR, 3),
+    OR_LCL   = round(OR_LCL, 3),
+    OR_UCL   = round(OR_UCL, 3),
+    p_value  = round(p_val, 4),
+    Sig      = stars
+  )
+  rownames(out) <- NULL
+
+  print(kable(out,
+              caption = title,
+              col.names = c("Term", "OR", "95% LCL", "95% UCL", "p-value", ""),
+              row.names = FALSE) %>%
+          kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                        full_width = FALSE))
+  invisible(out)
+}
+```
+
+## 8.1 Full Model — HSV-1
+
+```{r logit-hsv1, message=FALSE, warning=FALSE}
+glm_hsv1 <- svyglm(
+  HSV1_pos ~ RIAGENDR + Age_cat + RIDRETH1 + DMDBORN4 +
+    DMDEDUC2 + DMDMARTL + BMI_cat + SMQ_cat +
+    ALQ_cat + DIQ_cat + FIPR_cat,
+  design = design_hsv1,
+  family = quasibinomial(link = "logit")
+)
+
+reg_print_logistic(glm_hsv1,
+  title = "Table: Adjusted Odds Ratios for HSV-1 Seropositivity (Survey-Weighted Logistic Regression); *** indicates significance, p-value of 0.0000 refers to values smaller than 0.0001")
+```
+
+## 8.2 Predicted Prevalence by Age Group — HSV-1
+
+```{r hsv1-predicted-age}
+# Predicted probability by age group (marginal effects)
+age_levels <- levels(design_hsv1$variables$Age_cat)
+age_levels <- age_levels[!is.na(age_levels)]
+
+pred_hsv1 <- svymean(~HSV1_pos, design = subset(design_hsv1, !is.na(Age_cat)),
+                     na.rm = TRUE)
+
+# Marginal means by age group
+age_prev_svy <- lapply(age_levels, function(ag) {
+  sub_d <- subset(design_hsv1, Age_cat == ag)
+  m <- tryCatch(svymean(~HSV1_pos, design = sub_d, na.rm = TRUE), error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  ci <- confint(m, df = degf(design_hsv1))
+  data.frame(
+    Age_cat    = ag,
+    Prevalence = round(100 * coef(m), 1),
+    LCL        = round(100 * ci[1], 1),
+    UCL        = round(100 * ci[2], 1)
+  )
+})
+age_prev_svy <- bind_rows(Filter(Negate(is.null), age_prev_svy))
+
+kable(age_prev_svy,
+      caption = "Survey-Weighted HSV-1 Prevalence by Age Group",
+      col.names = c("Age Group", "Prevalence (%)", "95% LCL", "95% UCL")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r hsv1-age-plot, fig.width=8, fig.height=4}
+ggplot(age_prev_svy, aes(x = Age_cat, y = Prevalence)) +
+  geom_point(size = 3, color = "#3182bd") +
+  geom_errorbar(aes(ymin = LCL, ymax = UCL), width = 0.3, color = "#3182bd") +
+  labs(
+    title = "Survey-Weighted HSV-1 Prevalence by Age Group",
+    x     = "Age Group",
+    y     = "Prevalence (%)"
+  ) +
+  theme_minimal()
+```
+
+---
+
+# Section 9: Survey-Weighted Logistic Regression — HSV-2
+
+## 9.1 Full Model — HSV-2
+
+```{r logit-hsv2, message=FALSE, warning=FALSE}
+glm_hsv2 <- svyglm(
+  HSV2_pos ~ RIAGENDR + Age_cat + RIDRETH1 + DMDBORN4 +
+    DMDEDUC2 + DMDMARTL + BMI_cat + SMQ_cat +
+    ALQ_cat + DIQ_cat + FIPR_cat,
+  design = design_hsv2,
+  family = quasibinomial(link = "logit")
+)
+
+reg_print_logistic(glm_hsv2,
+  title = "Table: Adjusted Odds Ratios for HSV-2 Seropositivity (Survey-Weighted Logistic Regression); *** indicates significance, p-value of 0.0000 refers to values smaller than 0.0001")
+```
+
+## 9.2 Predicted Prevalence by Age Group — HSV-2
+
+```{r hsv2-predicted-age}
+age_prev_svy2 <- lapply(age_levels, function(ag) {
+  sub_d <- tryCatch(subset(design_hsv2, Age_cat == ag), error = function(e) NULL)
+  if (is.null(sub_d)) return(NULL)
+  m <- tryCatch(svymean(~HSV2_pos, design = sub_d, na.rm = TRUE), error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  ci <- confint(m, df = degf(design_hsv2))
+  data.frame(
+    Age_cat    = ag,
+    Prevalence = round(100 * coef(m), 1),
+    LCL        = round(100 * ci[1], 1),
+    UCL        = round(100 * ci[2], 1)
+  )
+})
+age_prev_svy2 <- bind_rows(Filter(Negate(is.null), age_prev_svy2))
+
+kable(age_prev_svy2,
+      caption = "Survey-Weighted HSV-2 Prevalence by Age Group",
+      col.names = c("Age Group", "Prevalence (%)", "95% LCL", "95% UCL")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r hsv2-age-plot, fig.width=8, fig.height=4}
+# Combine HSV-1 and HSV-2 age prevalence for comparison
+if (nrow(age_prev_svy) > 0 && nrow(age_prev_svy2) > 0) {
+  combined_age <- bind_rows(
+    age_prev_svy  %>% mutate(Type = "HSV-1"),
+    age_prev_svy2 %>% mutate(Type = "HSV-2")
+  )
+  ggplot(combined_age, aes(x = Age_cat, y = Prevalence, color = Type, group = Type)) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = LCL, ymax = UCL), width = 0.3) +
+    scale_color_manual(values = c("HSV-1" = "#3182bd", "HSV-2" = "#e6550d")) +
+    labs(
+      title = "Survey-Weighted HSV-1 and HSV-2 Prevalence by Age Group",
+      x     = "Age Group",
+      y     = "Prevalence (%)",
+      color = "HSV Type"
+    ) +
+    theme_minimal()
+}
+```
+
+## 9.3 HSV-2 Prevalence by Sex — Comparison Plot
+
+```{r hsv2-sex-race-plot, fig.width=10, fig.height=5}
+sex_race_prev <- svy_hsv2 %>%
+  filter(!is.na(RIAGENDR), !is.na(RIDRETH1)) %>%
+  group_by(RIAGENDR, RIDRETH1) %>%
+  summarise(
+    Prevalence = 100 * mean(HSV2_pos, na.rm = TRUE),
+    N = n(),
+    .groups = "drop"
+  )
+
+ggplot(sex_race_prev, aes(x = RIDRETH1, y = Prevalence, fill = RIAGENDR)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Male" = "#3182bd", "Female" = "#e6550d"),
+                    na.value = "grey50") +
+  labs(
+    title = "HSV-2 Seroprevalence by Race/Ethnicity and Sex",
+    x     = "Race/Ethnicity",
+    y     = "Seroprevalence (%)",
+    fill  = "Sex"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+# Section 10: Subgroup Analysis — HSV-2 Among Adults 18+
+
+HSV-2 is primarily a sexually transmitted infection and is most relevant to investigate in the adult population. This section restricts the analytic sample to adults aged 18 and older and re-runs the logistic regression.
+
+```{r hsv2-adults, message=FALSE, warning=FALSE}
+svy_hsv2_adult <- svy_hsv2 %>%
+  filter(!is.na(RIDAGEYR), RIDAGEYR >= 18, !is.na(HSV2_pos))
+
+design_hsv2_adult <- svydesign(
+  data    = svy_hsv2_adult,
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~adj_wt,
+  nest    = TRUE
+)
+
+cat("Adult (18+) sample for HSV-2 analysis:", nrow(svy_hsv2_adult), "\n")
+
+glm_hsv2_adult <- svyglm(
+  HSV2_pos ~ RIAGENDR + Age_cat + RIDRETH1 + DMDBORN4 +
+    DMDEDUC2 + DMDMARTL + BMI_cat + SMQ_cat +
+    ALQ_cat + DIQ_cat + FIPR_cat,
+  design = design_hsv2_adult,
+  family = quasibinomial(link = "logit")
+)
+
+reg_print_logistic(glm_hsv2_adult,
+  title = "Table: Adjusted ORs for HSV-2 — Adults 18+ (Survey-Weighted); *** indicates significance, p-value of 0.0000 refers to values smaller than 0.0001")
+```
+
+---
+
+# Section 11: Co-Infection Analysis
+
+Assess the prevalence and correlates of co-infection (HSV-1 AND HSV-2 positive).
+
+```{r co-infection}
+co_inf_data <- svy_data %>%
+  filter(!is.na(HSV1_pos), !is.na(HSV2_pos)) %>%
+  mutate(HSV_both = as.integer(HSV1_pos == 1 & HSV2_pos == 1))
+
+design_coinf <- svydesign(
+  data    = co_inf_data,
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~adj_wt,
+  nest    = TRUE
+)
+
+prev_coinf <- svymean(~HSV_both, design = design_coinf, na.rm = TRUE)
+ci_coinf   <- confint(prev_coinf, df = degf(design_coinf))
+
+cat(sprintf("Population-weighted HSV-1 + HSV-2 co-infection prevalence: %.1f%%  (95%% CI: %.1f%% - %.1f%%)\n",
+            100 * coef(prev_coinf), 100 * ci_coinf[1], 100 * ci_coinf[2]))
+
+# Cross-tab
+coinf_tbl <- table(
+  HSV1 = ifelse(co_inf_data$HSV1_pos == 1, "HSV-1 Positive", "HSV-1 Negative"),
+  HSV2 = ifelse(co_inf_data$HSV2_pos == 1, "HSV-2 Positive", "HSV-2 Negative")
+)
+kable(coinf_tbl,
+      caption = "Cross-Tabulation: HSV-1 vs HSV-2 Status (Unweighted)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+---
+
+# Section 12: Summary and Key Findings
+
+```{r summary-table, message=FALSE, warning=FALSE}
+# Compile OR summaries from both models for key predictors
+extract_or_summary <- function(model, response_label) {
+  glm_summary <- summary(model)
+  coeff  <- glm_summary$coefficients[, 1]
+  p_val  <- glm_summary$coefficients[, 4]
+  CI     <- confint(model)
+  OR     <- exp(coeff)
+  OR_LCL <- exp(CI[, 1])
+  OR_UCL <- exp(CI[, 2])
+
+  data.frame(
+    Outcome = response_label,
+    Term    = names(coeff),
+    OR      = round(OR, 2),
+    LCL     = round(OR_LCL, 2),
+    UCL     = round(OR_UCL, 2),
+    p       = round(p_val, 3),
+    stringsAsFactors = FALSE
+  )
+}
+
+or1 <- extract_or_summary(glm_hsv1, "HSV-1")
+or2 <- extract_or_summary(glm_hsv2, "HSV-2")
+or_combined <- bind_rows(or1, or2)
+
+# Show only significant predictors (p < 0.05)
+sig_predictors <- or_combined %>%
+  filter(p < 0.05, Term != "(Intercept)") %>%
+  arrange(Outcome, p)
+
+if (nrow(sig_predictors) > 0) {
+  kable(sig_predictors,
+        caption = "Statistically Significant Predictors of HSV Seropositivity (p < 0.05); *** indicates significance, p-value of 0.0000 refers to values smaller than 0.0001",
+        col.names = c("Outcome", "Predictor", "OR", "95% LCL", "95% UCL", "p-value"),
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE)
+} else {
+  cat("No predictors reached p < 0.05 significance threshold.\n")
+  cat("(This may occur if weights are very variable or sample is small.)\n")
+}
+```
+
+---
+
+## Key Analysis Notes
+
+The following important methodological notes apply to this analysis (adapted from the project notes):
+
+1. **Survey Weights**: The HSV lab subsample weight (`HSV_WT`) is the correct weight for all analyses. It is the most restrictive weight in this analysis. When pooling multiple NHANES cycles, the weight is divided by the number of 2-year cycles.
+
+2. **Reference Categories**: The alphabetical ordering of factor levels determines the reference category in R. Where numbering prefixes are used (e.g., "1 NH White"), the first level serves as reference. Review reference categories carefully when interpreting odds ratios.
+
+3. **Non-Responsive Handling**: NHANES does not apply a uniform "Refused/Don't Know" code across all cycles and variables. The `clean_non_resp()` function in this notebook standardizes these to "8 Non-Responsive". These categories are included in models and their estimates should be interpreted with caution.
+
+4. **Binary Response Coding**: After `translated = TRUE` is applied in nhanesA, HSV-1 and HSV-2 results may be returned as text ("Positive"/"Negative") or as numeric codes (1/2). The `case_when()` statement handles both.
+
+5. **Weight Column Detection**: The weight column in each HSV cycle table is the second column (immediately after SEQN). This convention is standard in NHANES lab tables.
+
+6. **Logistic vs. Linear Regression**: Because HSV seropositivity is binary, survey-weighted logistic regression (`svyglm` with `family = quasibinomial`) is used, producing prevalence odds ratios. The `quasibinomial` family is preferred over `binomial` for survey data to avoid incorrect variance assumptions.
+
+---
+
+# Section 13: Research Questions Addressed by This Analysis
+
+## Primary Research Questions
+
+**1. What is the current US population-level prevalence of HSV-1 and HSV-2?**
+Survey-weighted prevalence estimates with 95% CIs representing the entire US civilian non-institutionalized population (pooled across all available NHANES cycles). See Section 5.2.
+
+**2. How has HSV seroprevalence changed over time?**
+Cycle-by-cycle prevalence table (Section 5.3) tracks trends across decades of NHANES data.
+
+---
+
+## Demographic Risk Factor Questions
+
+**3. Does sex (male vs. female) predict HSV seropositivity?**
+Women are consistently more susceptible to HSV-2 due to biological and anatomical factors; the regression tests this in the current dataset.
+
+**4. How does HSV prevalence vary by age group?**
+Cumulative exposure hypothesis: older adults should have higher HSV-1 and HSV-2 prevalence. See Sections 5.4, 8.2, and 9.2.
+
+**5. Are there racial/ethnic disparities in HSV seroprevalence?**
+A well-documented finding in prior literature; this analysis provides updated population-weighted estimates. See Sections 5.5, 7.1, and 7.2.
+
+**6. Does country of birth (US-born vs. foreign-born) influence HSV risk?**
+Immigration patterns and differing childhood HSV-1 exposure rates in other countries may drive differences in seropositivity.
+
+**7. Is education level associated with HSV seropositivity?**
+Education is a proxy for health literacy, sexual health awareness, and socioeconomic position.
+
+**8. Does marital status predict HSV status?**
+Number of lifetime partners is a known risk factor; marital status serves as a partial proxy.
+
+---
+
+## Socioeconomic and Behavioral Risk Factor Questions
+
+**9. Does poverty (poverty-income ratio) predict HSV seroprevalence?**
+*Possible Hypothesis*: Lower-income populations face greater barriers to prevention and testing.
+
+**10. Is smoking status independently associated with HSV seropositivity?**
+*Possible Hypothesis*: Smoking may impair immune function and is correlated with sexual risk behaviors.
+
+**11. Does alcohol use predict HSV status?**
+*Possible Hypothesis*: Alcohol use is associated with risky sexual behavior.
+
+**12. Is diabetes independently associated with HSV?**
+*Possible Hypothesis*: Diabetics have impaired immune responses and more frequent HSV reactivation; the direction of association is epidemiologically informative.
+
+**13. Does BMI modify HSV risk?**
+*Possible Hypothesis*: Obesity is associated with immune dysregulation; the analysis tests whether it is an independent predictor after adjustment for other covariates.
+
+---
+
+## Adjusted / Independent Association Questions
+
+**14. Which risk factors remain independently associated with HSV-1 after adjusting for all other covariates simultaneously?**
+See Section 8 — multivariable survey-weighted logistic regression for HSV-1.
+
+**15. Which risk factors remain independently associated with HSV-2 after full adjustment?**
+See Section 9 — multivariable survey-weighted logistic regression for HSV-2.
+
+**16. Are the risk factor profiles for HSV-1 and HSV-2 different?**
+HSV-1 is primarily an oral/childhood exposure; HSV-2 is primarily sexually transmitted. Comparing the two OR tables (Sections 8 and 9) reveals whether predictors differ between the two types.
+
+**17. Among adults 18+ specifically, what predicts HSV-2 seropositivity?**
+Section 10 restricts the analytic sample to adults, where sexual transmission is the relevant pathway, and re-runs the full logistic regression.
+
+---
+
+## Limitations — What This Analysis Cannot Answer
+
+- **Incidence**: NHANES is cross-sectional; it cannot distinguish new infections from long-standing ones.
+- **Causal inference**: Associations are observational and subject to unmeasured confounding.
+- **HSV symptom severity or recurrence**: Only seropositivity (ever-infected) is measured, not clinical outcomes.
+- **Genital vs. oral HSV-1**: `LBXHE1` indicates HSV-1 antibody status only, not anatomical site of infection.
+- **Partner-level or network-level transmission dynamics**: Individual-level survey data cannot capture transmission networks.
+
+---
+
+```{r session-info}
+cat("\n=== Session Information ===\n")
+sessionInfo()
+```

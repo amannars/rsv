@@ -1,0 +1,781 @@
+---
+title: "HSV Seroprevalence in NHANES: Manuscript Tables and Figures"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+geometry: "margin=1in"
+fontsize: 11pt
+header-includes: 
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \floatplacement{figure}{H}
+  - \floatplacement{table}{H}
+  - \captionsetup[table]{labelsep=period, singlelinecheck=false}
+  - \captionsetup[figure]{labelsep=period}
+output:
+  pdf_document:
+    keep_tex: false
+    latex_engine: xelatex
+    toc: false
+    number_sections: false
+    fig_caption: true
+    fig_width: 6.5
+    fig_height: 4.5
+    df_print: kable
+    extra_dependencies:
+      - booktabs
+      - longtable
+      - array
+      - float
+      - caption
+      - colortbl
+      - xcolor
+  word_document:
+    toc: false
+    fig_caption: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+
+```{r setup, include=FALSE}
+# ============================================================
+# Global chunk options
+# ============================================================
+knitr::opts_chunk$set(
+  echo    = FALSE,   # hide code in output — change to TRUE for supplement
+  message = FALSE,
+  warning = FALSE,
+  results = "asis",  # needed so kable HTML/LaTeX passes through
+  fig.pos = "H"      # keep figures at their insertion point (PDF)
+)
+
+options(scipen = 10, digits = 4, knitr.kable.NA = "—")
+```
+
+```{r libraries}
+# ============================================================
+# Required libraries — install if missing:
+#   install.packages(c("nhanesA","dplyr","purrr","tibble","survey",
+#                      "ggplot2","knitr","kableExtra","tidyr",
+#                      "DiagrammeR","DiagrammeRsvg","rsvg","png"))
+# ============================================================
+library(nhanesA)     # NHANES data retrieval
+library(dplyr)       # data wrangling
+library(purrr)       # map_dfr etc.
+library(tibble)      # tidy data frames
+library(survey)      # complex survey analysis
+library(ggplot2)     # graphics
+library(knitr)       # table rendering
+library(kableExtra)  # enhanced table formatting
+library(tidyr)       # pivoting
+
+# For the flowchart (Figure 1) — uses Graphviz via DiagrammeR
+library(DiagrammeR)
+library(DiagrammeRsvg)  # export SVG
+library(rsvg)           # SVG → PNG (needed for PDF/Word output)
+library(png)            # read PNG back in for knitr
+
+# Determine output format once so formatting helpers can branch on it
+#out_fmt <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+# is_pdf  <- identical(out_fmt, "latex")
+# With this — evaluates lazily at render time:
+is_pdf  <- function() isTRUE(knitr::is_latex_output())
+is_word <- function() isTRUE(knitr::pandoc_to() == "docx")
+is_html <- function() !is_pdf() && !is_word()
+#is_word <- identical(out_fmt, "docx")
+#is_html <- !is_pdf && !is_word
+```
+
+```{r data-download, cache=TRUE, cache.comments=FALSE}
+# ============================================================
+# SECTION 1 — Data Download
+# All NHANES tables are downloaded from the CDC website.
+# cache=TRUE means this only runs once per session; delete the
+# _cache/ folder to force a fresh download.
+# ============================================================
+
+# ---- HSV serology tables ----
+hsv_tables <- nhanesSearchVarName(varname = "LBXHE1")
+
+download_hsv_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    wt_cols <- grep("^WT", names(df), value = TRUE)
+    if (length(wt_cols) > 0) {
+      df <- df %>% rename(HSV_WT = !!sym(wt_cols[1]))
+    } else {
+      df$HSV_WT <- NA_real_
+    }
+    keep_cols <- intersect(names(df), c("SEQN","HSV_WT","LBXHE1","LBXHE2"))
+    df %>% select(all_of(keep_cols)) %>% mutate(hsv_cycle = tbl_name)
+  }, error = function(e) NULL)
+}
+
+hsv_raw <- bind_rows(Filter(Negate(is.null), lapply(hsv_tables, download_hsv_table)))
+
+# ---- Demographics ----
+demo_tables_all <- nhanesSearchTableNames("DEMO")
+demo_keepers    <- c("SEQN","SDDSRVYR","RIDSTATR","WTINT2YR","WTMEC2YR",
+                     "SDMVPSU","SDMVSTRA","RIAGENDR","RIDAGEYR",
+                     "RIDRETH1","RIDRETH3","DMDMARTL","DMDEDUC2",
+                     "DMDBORN4","INDFMPIR")
+
+download_demo_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE) %>%
+      mutate(across(everything(), as.character)) %>%
+      mutate(demo_cycle = tbl_name)
+    keep <- intersect(names(df), c(demo_keepers, "demo_cycle"))
+    df %>% select(all_of(keep))
+  }, error = function(e) NULL)
+}
+
+demo_raw <- bind_rows(Filter(Negate(is.null), lapply(demo_tables_all, download_demo_table)))
+
+# ---- BMI ----
+download_bmi_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    if (!"BMXBMI" %in% names(df)) return(NULL)
+    df %>% select(SEQN, BMXBMI) %>% mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+bmi_raw <- bind_rows(Filter(Negate(is.null),
+  lapply(nhanesSearchTableNames("BMX"), download_bmi_table))) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+# ---- Smoking ----
+download_smq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    keep <- intersect(names(df), c("SEQN","SMQ020","SMQ040"))
+    if (length(keep) < 2) return(NULL)
+    df %>% select(all_of(keep)) %>% mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+smq_raw <- bind_rows(Filter(Negate(is.null),
+  lapply(nhanesSearchTableNames("SMQ"), download_smq_table))) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+# ---- Alcohol ----
+download_alq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    keep <- intersect(names(df), c("SEQN","ALQ101","ALQ110"))
+    if (length(keep) < 2) return(NULL)
+    df %>% select(all_of(keep)) %>% mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+alq_raw <- bind_rows(Filter(Negate(is.null),
+  lapply(nhanesSearchTableNames("ALQ"), download_alq_table))) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+# ---- Diabetes ----
+download_diq_table <- function(tbl_name) {
+  tryCatch({
+    df <- nhanes(tbl_name, translated = TRUE, cleanse_numeric = TRUE)
+    if (!"DIQ010" %in% names(df)) return(NULL)
+    df %>% select(SEQN, DIQ010) %>% mutate(across(everything(), as.character))
+  }, error = function(e) NULL)
+}
+diq_raw <- bind_rows(Filter(Negate(is.null),
+  lapply(nhanesSearchTableNames("DIQ"), download_diq_table))) %>%
+  distinct(SEQN, .keep_all = TRUE)
+```
+
+```{r data-merge-clean, cache=TRUE, dependson="data-download"}
+# ============================================================
+# SECTION 2 — Merge and Clean
+# Track row counts at each step for the flowchart.
+# ============================================================
+
+n_hsv_raw  <- nrow(hsv_raw)          # all HSV records across cycles
+n_demo_raw <- nrow(demo_raw)         # all demographic records
+
+# -- Merge HSV to demographics (and other covariates) --
+data_merged <- hsv_raw %>%
+  mutate(SEQN = as.character(SEQN)) %>%
+  left_join(demo_raw  %>% mutate(SEQN = as.character(SEQN)) %>%
+              select(-any_of("demo_cycle")),         by = "SEQN") %>%
+  left_join(bmi_raw   %>% mutate(SEQN = as.character(SEQN)), by = "SEQN") %>%
+  left_join(smq_raw   %>% mutate(SEQN = as.character(SEQN)), by = "SEQN") %>%
+  left_join(alq_raw   %>% mutate(SEQN = as.character(SEQN)), by = "SEQN") %>%
+  left_join(diq_raw   %>% mutate(SEQN = as.character(SEQN)), by = "SEQN")
+
+n_merged <- nrow(data_merged)
+
+# ---- Encode response variables ----
+data_merged <- data_merged %>%
+  mutate(
+    HSV1_pos = case_when(
+      grepl("^[Pp]ositive", as.character(LBXHE1)) ~ 1L,
+      grepl("^[Nn]egative", as.character(LBXHE1)) ~ 0L,
+      LBXHE1 == "1" ~ 1L,  LBXHE1 == "2" ~ 0L,
+      TRUE ~ NA_integer_),
+    HSV2_pos = case_when(
+      grepl("^[Pp]ositive", as.character(LBXHE2)) ~ 1L,
+      grepl("^[Nn]egative", as.character(LBXHE2)) ~ 0L,
+      LBXHE2 == "1" ~ 1L,  LBXHE2 == "2" ~ 0L,
+      TRUE ~ NA_integer_)
+  )
+
+n_no_hsv_result <- sum(is.na(data_merged$HSV1_pos) & is.na(data_merged$HSV2_pos))
+
+# ---- Clean and categorize covariates ----
+clean_non_resp <- function(x) {
+  x[x %in% c("Refused","Don't Know","Don't know","7","9","77","99")] <- "9 Missing"
+  x[is.na(x)] <- "9 Missing"
+  x
+}
+
+clean_data <- data_merged %>%
+  mutate(
+    RIDAGEYR = suppressWarnings(as.numeric(RIDAGEYR)),
+    INDFMPIR = suppressWarnings(as.numeric(INDFMPIR)),
+    BMXBMI   = suppressWarnings(as.numeric(BMXBMI)),
+    HSV_WT   = suppressWarnings(as.numeric(HSV_WT)),
+    WTMEC2YR = suppressWarnings(as.numeric(WTMEC2YR)),
+    WTINT2YR = suppressWarnings(as.numeric(WTINT2YR)),
+    SDMVPSU  = suppressWarnings(as.numeric(SDMVPSU)),
+    SDMVSTRA = suppressWarnings(as.numeric(SDMVSTRA))
+  ) %>%
+  mutate(across(c(DMDMARTL, RIDRETH1, RIDRETH3, DMDEDUC2, DMDBORN4),
+                clean_non_resp)) %>%
+  mutate(
+    Age_cat = case_when(
+      RIDAGEYR >= 14 & RIDAGEYR < 20 ~ "1 14–19",
+      RIDAGEYR >= 20 & RIDAGEYR < 30 ~ "2 20–29",
+      RIDAGEYR >= 30 & RIDAGEYR < 40 ~ "3 30–39",
+      RIDAGEYR >= 40 & RIDAGEYR < 50 ~ "4 40–49",
+      RIDAGEYR >= 50 & RIDAGEYR < 60 ~ "5 50–59",
+      RIDAGEYR >= 60                 ~ "6 60+",
+      TRUE ~ NA_character_),
+    BMI_cat = case_when(
+      BMXBMI < 18.5                    ~ "1 Underweight/Normal",
+      BMXBMI >= 18.5 & BMXBMI < 25    ~ "1 Underweight/Normal",
+      BMXBMI >= 25   & BMXBMI < 30    ~ "2 Overweight",
+      BMXBMI >= 30                     ~ "3 Obese",
+      TRUE ~ "9 Missing"),
+    SMQ_cat = case_when(
+      SMQ020 == "No"                                    ~ "1 Never smoked",
+      SMQ040 %in% c("Every day","Some days")            ~ "3 Current smoker",
+      SMQ020 == "Yes" & !SMQ040 %in% c("Every day","Some days") ~ "2 Former smoker",
+      TRUE ~ "9 Missing"),
+    ALQ_cat = case_when(
+      ALQ101 == "No" | ALQ110 == "No"  ~ "1 Non-drinker",
+      ALQ101 == "Yes"                  ~ "2 Drinker",
+      TRUE ~ "9 Missing"),
+    DIQ_cat = case_when(
+      grepl("^[Nn]o",  DIQ010)         ~ "1 No",
+      grepl("^[Yy]es", DIQ010)         ~ "2 Yes",
+      grepl("[Bb]order", DIQ010)       ~ "1 No",   # borderline → no
+      TRUE ~ "9 Missing"),
+    FIPR_cat = case_when(
+      INDFMPIR <  1.5                   ~ "1 Below 1.5",
+      INDFMPIR >= 1.5 & INDFMPIR < 3.0 ~ "2 1.5–2.9",
+      INDFMPIR >= 3.0                   ~ "3 3.0+",
+      TRUE ~ "9 Missing")
+  )
+
+# ---- Survey weights: pool cycles ----
+n_cycles <- length(unique(clean_data$hsv_cycle))
+
+clean_data <- clean_data %>%
+  mutate(effective_wt = if_else(!is.na(HSV_WT) & HSV_WT > 0,
+                                HSV_WT, WTMEC2YR))
+
+analytic <- clean_data %>%
+  filter(!is.na(effective_wt), effective_wt > 0) %>%
+  mutate(adj_wt = effective_wt / n_cycles)
+
+n_analytic <- nrow(analytic)
+
+# Collapse non-responsive into missing; factorise
+analytic <- analytic %>%
+  mutate(across(c(DMDMARTL,RIDRETH1,RIDRETH3,DMDEDUC2,DMDBORN4,
+                  SMQ_cat,ALQ_cat,DIQ_cat,BMI_cat,FIPR_cat),
+                ~ if_else(. == "8 Non-Responsive", "9 Missing", .))) %>%
+  mutate(across(c(RIAGENDR,RIDRETH1,DMDBORN4,DMDEDUC2,DMDMARTL,
+                  Age_cat,BMI_cat,SMQ_cat,ALQ_cat,DIQ_cat,FIPR_cat), as.factor))
+
+# Build survey design objects
+svy_data <- analytic %>%
+  filter(!is.na(SDMVPSU), !is.na(SDMVSTRA))
+
+n_svy <- nrow(svy_data)
+n_no_weight <- n_analytic - n_svy
+
+svy_hsv1 <- svy_data %>% filter(!is.na(HSV1_pos))
+svy_hsv2 <- svy_data %>% filter(!is.na(HSV2_pos))
+
+n_hsv1 <- nrow(svy_hsv1)
+n_hsv2 <- nrow(svy_hsv2)
+n_hsv1_pos <- sum(svy_hsv1$HSV1_pos == 1)
+n_hsv1_neg <- sum(svy_hsv1$HSV1_pos == 0)
+n_hsv2_pos <- sum(svy_hsv2$HSV2_pos == 1)
+n_hsv2_neg <- sum(svy_hsv2$HSV2_pos == 0)
+
+design_hsv1 <- svydesign(data = svy_hsv1, id = ~SDMVPSU,
+                          strata = ~SDMVSTRA, weights = ~adj_wt, nest = TRUE)
+design_hsv2 <- svydesign(data = svy_hsv2, id = ~SDMVPSU,
+                          strata = ~SDMVSTRA, weights = ~adj_wt, nest = TRUE)
+```
+
+---
+
+# Figure 1. Data Reduction Flowchart
+
+```{r flowchart, fig.cap="Figure 1. Flowchart of data reduction steps for HSV seroprevalence analysis using pooled NHANES cycles. Numbers in parentheses denote respondents excluded at each step.", fig.width=6.5, fig.height=6.5, results="asis"}
+# ============================================================
+# FIGURE 1 — Data reduction flowchart
+# Built with DiagrammeR (Graphviz DOT), then exported to PNG
+# so it renders in both PDF and Word outputs.
+# ============================================================
+
+n_removed_nohsv   <- n_merged - n_analytic
+n_removed_nowt    <- n_no_weight
+n_removed_nodsgn  <- n_svy - n_hsv1   # those missing HSV1 result
+
+dot_code <- sprintf('
+digraph flowchart {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=11, splines=ortho,
+         size="6.5,9", ratio=compress, dpi=150]
+  node  [shape=box, style="filled,rounded", fillcolor="#DDEEFF",
+         fontname="Helvetica", fontsize=10, width=3.5, height=0.55]
+  edge  [fontname="Helvetica", fontsize=9, color="#555555"]
+  A [label="All NHANES DEMO respondents\\nn = %s", fillcolor="#B8D4F8"]
+  B [label="Merged with HSV serology data\\nn = %s", fillcolor="#B8D4F8"]
+  C [label="Valid survey weights applied\\n(pooled across %d NHANES cycles)\\nn = %s"]
+  D [label="Survey design object created\\n(PSU + stratum available)\\nn = %s"]
+  E [label="HSV-1 analytic sample\\nn = %s (pos: %s, neg: %s)"]
+  F [label="HSV-2 analytic sample\\nn = %s (pos: %s, neg: %s)"]
+  excl1 [label="Excluded: no HSV result or\\nmissing after merge\\nn = %s",
+          shape=box, style="filled", fillcolor="#FFE0CC", width=2.8]
+  excl2 [label="Excluded: missing weight\\nn = %s",
+          shape=box, style="filled", fillcolor="#FFE0CC", width=2.8]
+  excl3 [label="Excluded: missing PSU/strata\\nn = %s",
+          shape=box, style="filled", fillcolor="#FFE0CC", width=2.8]
+  A -> B
+  B -> C -> D
+  D -> E
+  D -> F
+  B -> excl1 [style=dashed, label=" excluded"]
+  C -> excl2 [style=dashed, label=" excluded"]
+  D -> excl3 [style=dashed, label=" excluded"]
+}
+',
+  format(n_demo_raw,  big.mark=","),
+  format(n_merged,    big.mark=","),
+  n_cycles,
+  format(n_analytic,  big.mark=","),
+  format(n_svy,       big.mark=","),
+  format(n_hsv1,      big.mark=","),
+  format(n_hsv1_pos,  big.mark=","),
+  format(n_hsv1_neg,  big.mark=","),
+  format(n_hsv2,      big.mark=","),
+  format(n_hsv2_pos,  big.mark=","),
+  format(n_hsv2_neg,  big.mark=","),
+  format(n_removed_nohsv,  big.mark=","),
+  format(n_removed_nowt,   big.mark=","),
+  format(n_removed_nodsgn, big.mark=",")
+)
+
+# Render with DiagrammeR → SVG → PNG (works for all output formats)
+grph  <- grViz(dot_code)
+svg_s <- export_svg(grph)
+tmp_svg <- tempfile(fileext = ".svg")
+tmp_png <- tempfile(fileext = ".png")
+writeLines(svg_s, tmp_svg)
+rsvg_png(tmp_svg, tmp_png, width = 1800, height = 1200)
+# Include in document
+knitr::include_graphics(tmp_png)
+```
+
+---
+
+# Table 1. Covariate Contingency Analysis — Sample and Population
+
+*Chi-square p-values for unweighted (sample) and survey-weighted (population) estimates. Statistically significant associations (α = 0.05) are indicated in bold.*
+
+```{r contingency-table}
+# ============================================================
+# TABLE 1 — Covariate contingency analysis
+# For each covariate: unweighted chi-sq and weighted svychisq
+# assembled into a single side-by-side table to save space.
+# ============================================================
+
+covariate_list <- list(
+  list(var = "RIAGENDR",  label = "Sex"),
+  list(var = "Age_cat",   label = "Age Group"),
+  list(var = "RIDRETH1",  label = "Race/Ethnicity"),
+  list(var = "DMDBORN4",  label = "Country of Birth"),
+  list(var = "DMDEDUC2",  label = "Education Level"),
+  list(var = "DMDMARTL",  label = "Marital Status"),
+  list(var = "BMI_cat",   label = "BMI Category"),
+  list(var = "SMQ_cat",   label = "Smoking Status"),
+  list(var = "ALQ_cat",   label = "Alcohol Use"),
+  list(var = "DIQ_cat",   label = "Diabetes Status"),
+  list(var = "FIPR_cat",  label = "Poverty-Income Ratio")
+)
+
+# Helper: build one row per covariate × HSV type
+contingency_row <- function(cov_var, cov_label, hsv_var, hsv_label,
+                            raw_data, svy_design) {
+  # --- Unweighted chi-sq ---
+  sub_u <- raw_data %>%
+    filter(!is.na(.data[[cov_var]]), !is.na(.data[[hsv_var]]))
+  tbl_u <- table(sub_u[[cov_var]], sub_u[[hsv_var]])
+  p_unw <- tryCatch(chisq.test(tbl_u, simulate.p.value = TRUE)$p.value, error = function(e) NA)
+
+  # --- Weighted svychisq ---
+  frm <- as.formula(paste0("~", cov_var, "+", hsv_var))
+  p_wt <- tryCatch(svychisq(frm, svy_design)$p.value, error = function(e) NA)
+
+  # Categories breakdown (for unweighted): N, %pos
+  cats <- levels(droplevels(sub_u[[cov_var]]))
+  rows <- lapply(cats, function(cat) {
+    sub_c <- sub_u %>% filter(.data[[cov_var]] == cat)
+    n_tot <- nrow(sub_c)
+    n_pos <- sum(sub_c[[hsv_var]] == 1, na.rm = TRUE)
+    pct   <- if (n_tot > 0) round(100 * n_pos / n_tot, 1) else NA
+    data.frame(Variable = cov_label, Category = cat,
+               N = n_tot, Pct_Pos_Sample = pct, stringsAsFactors = FALSE)
+  })
+  tbl_rows <- bind_rows(rows)
+  tbl_rows$p_sample <- ifelse(tbl_rows$Category == cats[1],
+                              round(p_unw, 3), NA)
+  # Population prevalence (weighted) per category
+  cats_wt <- tryCatch({
+    sapply(cats, function(cat) {
+      sub_d <- tryCatch(subset(svy_design, .data[[cov_var]] == cat),
+                        error = function(e) NULL)
+      if (is.null(sub_d)) return(NA)
+      m <- tryCatch(svymean(as.formula(paste0("~", hsv_var)),
+                            design = sub_d, na.rm = TRUE), error = function(e) NULL)
+      if (is.null(m)) return(NA)
+      round(100 * coef(m), 1)
+    })
+  }, error = function(e) rep(NA, length(cats)))
+
+  tbl_rows$Pct_Pos_Pop <- as.numeric(cats_wt)
+  tbl_rows$p_pop <- ifelse(tbl_rows$Category == cats[1],
+                           round(p_wt, 3), NA)
+  tbl_rows$HSV_type <- hsv_label
+  tbl_rows
+}
+
+# Build tables for HSV-1 and HSV-2
+rows_hsv1 <- bind_rows(lapply(covariate_list, function(cov)
+  contingency_row(cov$var, cov$label, "HSV1_pos", "HSV-1",
+                  svy_hsv1, design_hsv1)))
+
+rows_hsv2 <- bind_rows(lapply(covariate_list, function(cov)
+  contingency_row(cov$var, cov$label, "HSV2_pos", "HSV-2",
+                  svy_hsv2, design_hsv2)))
+
+# Combine side-by-side (HSV-1 left, HSV-2 right) — merge on Variable + Category
+tbl1 <- rows_hsv1 %>%
+  select(Variable, Category, N,
+         HSV1_Sample_Pct = Pct_Pos_Sample, p_hsv1_sample = p_sample,
+         HSV1_Pop_Pct    = Pct_Pos_Pop,    p_hsv1_pop    = p_pop) %>%
+  left_join(
+    rows_hsv2 %>% select(Variable, Category,
+                         HSV2_Sample_Pct = Pct_Pos_Sample, p_hsv2_sample = p_sample,
+                         HSV2_Pop_Pct    = Pct_Pos_Pop,    p_hsv2_pop    = p_pop),
+    by = c("Variable","Category"))
+
+# Format p-values: bold+asterisk when < 0.05
+fmt_p <- function(x) {
+  ifelse(is.na(x), "",
+         ifelse(x < 0.001, "< 0.001*",
+                ifelse(x < 0.05,  paste0(sprintf("%.3f", x), "*"),
+                       sprintf("%.3f", x))))
+}
+
+tbl1_fmt <- tbl1 %>%
+  mutate(
+    p_hsv1_sample = fmt_p(p_hsv1_sample),
+    p_hsv1_pop    = fmt_p(p_hsv1_pop),
+    p_hsv2_sample = fmt_p(p_hsv2_sample),
+    p_hsv2_pop    = fmt_p(p_hsv2_pop)
+  )
+
+# Collapse p-value columns with %pos into tidy display strings
+tbl1_fmt <- tbl1_fmt %>%
+  mutate(
+    HSV1_Sample = ifelse(!is.na(HSV1_Sample_Pct),
+                         paste0(HSV1_Sample_Pct, "%"), ""),
+    HSV1_Pop    = ifelse(!is.na(HSV1_Pop_Pct),
+                         paste0(HSV1_Pop_Pct,    "%"), ""),
+    HSV2_Sample = ifelse(!is.na(HSV2_Sample_Pct),
+                         paste0(HSV2_Sample_Pct, "%"), ""),
+    HSV2_Pop    = ifelse(!is.na(HSV2_Pop_Pct),
+                         paste0(HSV2_Pop_Pct,    "%"), "")
+  ) %>%
+  select(Variable, Category, N,
+         HSV1_Sample, p_hsv1_sample, HSV1_Pop, p_hsv1_pop,
+         HSV2_Sample, p_hsv2_sample, HSV2_Pop, p_hsv2_pop)
+
+kable(tbl1_fmt,
+      format    = ifelse(is_pdf(), "latex", "html"),
+      booktabs  = TRUE,
+      linesep   = "",
+      col.names = c("Variable","Category","N",
+                    "% Pos","p","% Pos (wt)","p",
+                    "% Pos","p","% Pos (wt)","p"),
+      align     = c("l","l","r","r","r","r","r","r","r","r","r"),
+      caption   = "Table 1. Covariate contingency table analysis: unweighted NHANES sample and weighted population estimates for HSV-1 and HSV-2 seropositivity. Asterisk (*) denotes p < 0.05.") %>%
+  kable_styling(
+    bootstrap_options = c("striped","condensed","hover"),
+    latex_options     = c("striped","hold_position","scale_down"),
+    font_size         = 9,
+    full_width        = FALSE) %>%
+  add_header_above(c(" " = 3,
+                     "HSV-1 Sample" = 2, "HSV-1 Population" = 2,
+                     "HSV-2 Sample" = 2, "HSV-2 Population" = 2)) %>%
+  column_spec(1, bold = TRUE) %>%
+  footnote(general = "% Pos = percentage seropositive within category. p = chi-square p-value (unweighted) or Rao-Scott chi-square p-value (weighted). * p < 0.05.",
+           general_title = "Note:",
+           footnote_as_chunk = TRUE)
+```
+
+---
+
+# Table 2. Covariate Logistic Regression — Odds Ratios
+
+*Adjusted odds ratios from survey-weighted logistic regression (svyglm, quasibinomial logit family) using all covariates simultaneously. Reference categories are the lowest-numbered factor level.*
+
+```{r regression-table}
+# ============================================================
+# TABLE 2 — Survey-weighted logistic regression (all covariates)
+# One model per HSV type; displayed side-by-side.
+# ============================================================
+
+# Fit models
+glm_hsv1 <- svyglm(
+  HSV1_pos ~ RIAGENDR + Age_cat + RIDRETH1 + DMDBORN4 +
+    DMDEDUC2 + DMDMARTL + BMI_cat + SMQ_cat +
+    ALQ_cat  + DIQ_cat  + FIPR_cat,
+  design = design_hsv1,
+  family = quasibinomial(link = "logit"))
+
+glm_hsv2 <- svyglm(
+  HSV2_pos ~ RIAGENDR + Age_cat + RIDRETH1 + DMDBORN4 +
+    DMDEDUC2 + DMDMARTL + BMI_cat + SMQ_cat +
+    ALQ_cat  + DIQ_cat  + FIPR_cat,
+  design = design_hsv2,
+  family = quasibinomial(link = "logit"))
+
+# Helper: extract OR table from a svyglm model
+extract_or_table <- function(model, prefix) {
+  s   <- summary(model)
+  cof <- s$coefficients[, 1]
+  pv  <- s$coefficients[, 4]
+  ci  <- confint(model)
+  data.frame(
+    Term                   = names(cof),
+    OR                     = exp(cof),
+    LCL                    = exp(ci[, 1]),
+    UCL                    = exp(ci[, 2]),
+    p                      = pv,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(Term != "(Intercept)") %>%
+    mutate(
+      OR_str  = sprintf("%.3f", OR),
+      CI_str  = sprintf("(%.3f, %.3f)", LCL, UCL),
+      p_str   = ifelse(p < 0.001, "< 0.001",
+                       sprintf("%.3f", p)),
+      sig     = ifelse(p < 0.05, "*", "")
+    ) %>%
+    rename_with(~ paste0(prefix, "_", .), c(OR_str, CI_str, p_str, sig))
+}
+
+or1 <- extract_or_table(glm_hsv1, "HSV1")
+or2 <- extract_or_table(glm_hsv2, "HSV2")
+
+# Merge on Term
+tbl2 <- full_join(
+  or1 %>% select(Term, HSV1_OR_str, HSV1_CI_str, HSV1_p_str, HSV1_sig),
+  or2 %>% select(Term, HSV2_OR_str, HSV2_CI_str, HSV2_p_str, HSV2_sig),
+  by = "Term"
+) %>%
+  # Make Term human-readable: strip factor level prefix glm adds
+  mutate(
+    Term = gsub("RIAGENDR",  "Sex: ",          Term),
+    Term = gsub("Age_cat",   "Age: ",           Term),
+    Term = gsub("RIDRETH1",  "Race/Ethn.: ",   Term),
+    Term = gsub("DMDBORN4",  "Country of Birth: ", Term),
+    Term = gsub("DMDEDUC2",  "Education: ",    Term),
+    Term = gsub("DMDMARTL",  "Marital Status: ", Term),
+    Term = gsub("BMI_cat",   "BMI: ",           Term),
+    Term = gsub("SMQ_cat",   "Smoking: ",       Term),
+    Term = gsub("ALQ_cat",   "Alcohol: ",       Term),
+    Term = gsub("DIQ_cat",   "Diabetes: ",      Term),
+    Term = gsub("FIPR_cat",  "Income-Poverty: ", Term)
+  ) %>%
+  # Combine OR + CI into one cell to save columns
+  mutate(
+    HSV1_OR_CI = paste0(HSV1_OR_str, "\n", HSV1_CI_str),
+    HSV2_OR_CI = paste0(HSV2_OR_str, "\n", HSV2_CI_str)
+  ) %>%
+  select(Term,
+         `HSV1_OR (95% CI)` = HSV1_OR_CI,
+         HSV1_p = HSV1_p_str, HSV1_sig,
+         `HSV2_OR (95% CI)` = HSV2_OR_CI,
+         HSV2_p = HSV2_p_str, HSV2_sig)
+
+kable(tbl2,
+      format   = ifelse(is_pdf(), "latex", "html"),
+      booktabs = TRUE,
+      linesep  = "",
+      col.names = c("Term",
+                    "OR (95% CI)", "p", "",
+                    "OR (95% CI)", "p", ""),
+      align    = c("l","r","r","c","r","r","c"),
+      caption  = "Table 2. Adjusted odds ratios from survey-weighted logistic regression for HSV-1 and HSV-2 seropositivity. All covariates entered simultaneously. * p < 0.05.") %>%
+  kable_styling(
+    bootstrap_options = c("striped","condensed","hover"),
+    latex_options     = c("striped","hold_position","scale_down"),
+    font_size         = 9,
+    full_width        = FALSE) %>%
+  add_header_above(c(" " = 1,
+                     "HSV-1 (Seropositive)" = 3,
+                     "HSV-2 (Seropositive)" = 3)) %>%
+  column_spec(1, width = "4cm") %>%
+  footnote(general = "OR = adjusted odds ratio. 95% CI = Wald confidence interval on the log-OR scale, exponentiated. Survey design accounted for using svyglm (quasibinomial logit). * p < 0.05.",
+           general_title = "Note:",
+           footnote_as_chunk = TRUE)
+```
+
+---
+
+# Table 3. Seroprevalence Results by Key Covariates
+
+*Survey-weighted (population-level) HSV-1 and HSV-2 seroprevalence by demographic group, with 95% confidence intervals.*
+
+```{r results-table}
+# ============================================================
+# TABLE 3 — Seroprevalence results table
+# Population-weighted point estimates + 95% CI per subgroup.
+# ============================================================
+
+# Helper: compute weighted prevalence for one subgroup level
+weighted_prev <- function(design, hsv_var, factor_var, level_val) {
+  sub_d <- tryCatch(
+    subset(design, .data[[factor_var]] == level_val),
+    error = function(e) NULL)
+  if (is.null(sub_d) || nrow(sub_d$variables) < 2) return(c(NA, NA, NA))
+  m  <- tryCatch(svymean(as.formula(paste0("~", hsv_var)),
+                         design = sub_d, na.rm = TRUE),
+                 error = function(e) NULL)
+  if (is.null(m)) return(c(NA, NA, NA))
+  ci <- tryCatch(confint(m, df = degf(sub_d)), error = function(e) matrix(NA, 1, 2))
+  c(round(100 * coef(m), 1), round(100 * ci[1], 1), round(100 * ci[2], 1))
+}
+
+build_prev_table <- function(design_h1, design_h2, cov_var, cov_label) {
+  levs <- levels(design_h1$variables[[cov_var]])
+  levs <- levs[!is.na(levs)]
+  lapply(levs, function(lv) {
+    p1 <- weighted_prev(design_h1, "HSV1_pos", cov_var, lv)
+    p2 <- weighted_prev(design_h2, "HSV2_pos", cov_var, lv)
+    data.frame(
+      Variable       = cov_label,
+      Category       = lv,
+      HSV1_Prev      = p1[1],
+      HSV1_LCL       = p1[2],
+      HSV1_UCL       = p1[3],
+      HSV2_Prev      = p2[1],
+      HSV2_LCL       = p2[2],
+      HSV2_UCL       = p2[3],
+      stringsAsFactors = FALSE)
+  }) %>% bind_rows()
+}
+
+tbl3 <- bind_rows(lapply(covariate_list, function(cov)
+  build_prev_table(design_hsv1, design_hsv2, cov$var, cov$label)))
+
+# Format prevalence + CI into one string
+tbl3_fmt <- tbl3 %>%
+  mutate(
+    HSV1_str = ifelse(is.na(HSV1_Prev), "—",
+                      sprintf("%.1f (%.1f–%.1f)", HSV1_Prev, HSV1_LCL, HSV1_UCL)),
+    HSV2_str = ifelse(is.na(HSV2_Prev), "—",
+                      sprintf("%.1f (%.1f–%.1f)", HSV2_Prev, HSV2_LCL, HSV2_UCL))
+  ) %>%
+  select(Variable, Category, HSV1_str, HSV2_str)
+
+kable(tbl3_fmt,
+      format   = ifelse(is_pdf(), "latex", "html"),
+      booktabs = TRUE,
+      linesep  = "",
+      col.names = c("Variable", "Category",
+                    "HSV-1 Seroprevalence % (95% CI)",
+                    "HSV-2 Seroprevalence % (95% CI)"),
+      align    = c("l","l","r","r"),
+      caption  = "Table 3. Survey-weighted seroprevalence of HSV-1 and HSV-2 by covariate subgroup (NHANES pooled cycles). Values are population-weighted percentages with 95% confidence intervals.") %>%
+  kable_styling(
+    bootstrap_options = c("striped","condensed","hover"),
+    latex_options     = c("striped","hold_position"),
+    font_size         = 9,
+    full_width        = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  footnote(general = paste0(
+    "Weighted estimates computed using svymean() with the NHANES complex survey design ",
+    "(PSU, strata, ", n_cycles, "-cycle pooled adjusted weights). ",
+    "95% CI based on linearisation with design degrees of freedom."),
+    general_title = "Note:",
+    footnote_as_chunk = TRUE)
+```
+
+---
+
+# Table 4. Overall Seroprevalence Summary
+
+```{r overall-summary}
+# ============================================================
+# TABLE 4 — Headline seroprevalence numbers for the abstract/
+# results section. One row per HSV type.
+# ============================================================
+
+prev_row <- function(design, hsv_var, label) {
+  m  <- svymean(as.formula(paste0("~", hsv_var)), design = design, na.rm = TRUE)
+  ci <- confint(m, df = degf(design))
+  n_total <- nrow(design$variables)
+  n_pos   <- sum(design$variables[[hsv_var]] == 1, na.rm = TRUE)
+  data.frame(
+    `HSV Type`       = label,
+    `N (analytic)`   = format(n_total, big.mark = ","),
+    `N Seropositive` = format(n_pos,   big.mark = ","),
+    `Seroprevalence (%)` = round(100 * coef(m), 1),
+    `95% LCL`            = round(100 * ci[1],  1),
+    `95% UCL`            = round(100 * ci[2],  1),
+    check.names = FALSE,
+    stringsAsFactors = FALSE)
+}
+
+tbl4 <- bind_rows(
+  prev_row(design_hsv1, "HSV1_pos", "HSV-1"),
+  prev_row(design_hsv2, "HSV2_pos", "HSV-2")
+)
+
+kable(tbl4,
+      format   = ifelse(is_pdf(), "latex", "html"),
+      booktabs = TRUE,
+      linesep  = "",
+      align    = c("l","r","r","r","r","r"),
+      caption  = "Table 4. Overall survey-weighted seroprevalence of HSV-1 and HSV-2 in the pooled NHANES analytic sample.") %>%
+  kable_styling(
+    bootstrap_options = c("striped","condensed"),
+    latex_options     = c("striped","hold_position"),
+    font_size         = 10,
+    full_width        = FALSE)
+```
+
+---
+
+
